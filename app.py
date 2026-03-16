@@ -9,11 +9,28 @@ from functools import wraps
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import os
+import requests
+from werkzeug.utils import secure_filename
+import base64
+from io import BytesIO
+from PIL import Image
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'supersecretkeyforexontogram2026'
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///exontogram.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# НАСТРОЙКИ ЗАГРУЗКИ ФАЙЛОВ
+app.config['UPLOAD_FOLDER'] = 'static/uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max
+app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
+
+# НАСТРОЙКИ СЖАТИЯ ИЗОБРАЖЕНИЙ
+app.config['MAX_IMAGE_SIZE'] = (800, 800)  # Максимальный размер для загруженных изображений
+app.config['AVATAR_SIZE'] = (200, 200)     # Размер аватарок
+app.config['THUMBNAIL_SIZE'] = (400, 400)  # Размер превью для постов
+app.config['IMAGE_QUALITY'] = 85            # Качество сжатия JPEG (1-100)
 
 # НАСТРОЙКИ ПОЧТЫ
 app.config['MAIL_SERVER'] = 'smtp.mail.ru'
@@ -21,6 +38,15 @@ app.config['MAIL_PORT'] = 465
 app.config['MAIL_USE_SSL'] = True
 app.config['MAIL_USERNAME'] = 'efmstudio@inbox.ru'
 app.config['MAIL_PASSWORD'] = 'TNYIFhKVKzEyiQ4GSXx5'
+
+# АВАТАР ПО УМОЛЧАНИЮ (1280x1280)
+DEFAULT_AVATAR_URL = "https://i.pinimg.com/originals/65/1c/6d/651c6da502353948bdc929f02da2b8e0.jpg?nii=t"
+
+# API для случайных котов
+CAT_API_URL = "https://api.thecatapi.com/v1/images/search"
+
+# Создаем папку для загрузок, если её нет
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 db = SQLAlchemy(app)
 
@@ -32,6 +58,7 @@ class User(db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False)
     display_name = db.Column(db.String(100))
     password_hash = db.Column(db.String(200))
+    avatar_url = db.Column(db.String(500), default=DEFAULT_AVATAR_URL)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     is_banned = db.Column(db.Boolean, default=False)
     is_admin = db.Column(db.Boolean, default=False)
@@ -102,24 +129,118 @@ class BanLog(db.Model):
     admin = db.relationship('User', foreign_keys=[admin_id])
     banned_user = db.relationship('User', foreign_keys=[banned_user_id])
 
+# ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С ИЗОБРАЖЕНИЯМИ ====================
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+def resize_image(input_path, output_path, max_size, quality=85):
+    """Изменяет размер изображения с сохранением пропорций"""
+    try:
+        with Image.open(input_path) as img:
+            # Конвертируем в RGB если нужно (для JPEG)
+            if img.mode in ('RGBA', 'LA', 'P'):
+                bg = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                bg.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                img = bg
+            
+            # Изменяем размер с сохранением пропорций
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
+            
+            # Сохраняем с оптимизацией
+            img.save(output_path, 'JPEG', quality=quality, optimize=True)
+            return True
+    except Exception as e:
+        print(f"Ошибка при изменении размера изображения: {e}")
+        return False
+
+def process_and_save_image(file, max_size, quality=85):
+    """Обрабатывает и сохраняет загруженное изображение"""
+    try:
+        # Генерируем уникальное имя файла
+        ext = file.filename.rsplit('.', 1)[1].lower()
+        filename = f"{uuid.uuid4()}.jpg"  # Всегда сохраняем как JPEG
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        
+        # Временное сохранение
+        temp_path = filepath + '.temp'
+        file.save(temp_path)
+        
+        # Изменяем размер и сохраняем
+        if resize_image(temp_path, filepath, max_size, quality):
+            os.remove(temp_path)  # Удаляем временный файл
+            return f'/static/uploads/{filename}'
+        else:
+            os.remove(temp_path)
+            return None
+    except Exception as e:
+        print(f"Ошибка обработки изображения: {e}")
+        return None
+
+def save_base64_image(base64_string, image_type='post'):
+    """Сохраняет base64 изображение с изменением размера"""
+    try:
+        # Удаляем префикс data:image/xxx;base64,
+        if 'base64,' in base64_string:
+            base64_string = base64_string.split('base64,')[1]
+        
+        # Декодируем base64
+        image_data = base64.b64decode(base64_string)
+        
+        # Выбираем размер в зависимости от типа
+        max_size = app.config['AVATAR_SIZE'] if image_type == 'avatar' else app.config['THUMBNAIL_SIZE']
+        
+        # Генерируем уникальное имя файла
+        filename = f"{uuid.uuid4()}.jpg"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        
+        # Сохраняем временно
+        temp_path = filepath + '.temp'
+        with open(temp_path, 'wb') as f:
+            f.write(image_data)
+        
+        # Изменяем размер и сохраняем
+        if resize_image(temp_path, filepath, max_size, app.config['IMAGE_QUALITY']):
+            os.remove(temp_path)
+            return f'/static/uploads/{filename}'
+        else:
+            os.remove(temp_path)
+            return None
+    except Exception as e:
+        print(f"Ошибка сохранения изображения: {e}")
+        return None
+
+def get_random_cat():
+    """Получает случайного кота из API"""
+    try:
+        response = requests.get(CAT_API_URL, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            return data[0]['url']
+    except:
+        pass
+    return "https://cdn2.thecatapi.com/images/MTYzOTU0Mg.jpg"  # Запасной кот
+
 # ==================== ФУНКЦИИ ОТПРАВКИ ПИСЕМ ====================
 
 def send_verification_email(user_email, code):
     sender = app.config['MAIL_USERNAME']
     password = app.config['MAIL_PASSWORD']
     
-    subject = "Код подтверждения для Exontogram"
+    subject = "Код подтверждения для EFM ID"
     body = f"""
     Здравствуйте!
     
-    Ваш код подтверждения для регистрации в Exontogram: {code}
+    Ваш код подтверждения для регистрации в системе EFM ID: {code}
     
     Код действителен в течение 15 минут.
     
-    Если вы не регистрировались на Exontogram, просто проигнорируйте это письмо.
+    Если вы не регистрировались в EFM ID, просто проигнорируйте это письмо.
     
     С уважением,
-    Команда Exontogram
+    Команда EFM ID
     """
     
     msg = MIMEMultipart()
@@ -143,16 +264,16 @@ def send_account_deletion_email(user_email, efm_id):
     sender = app.config['MAIL_USERNAME']
     password = app.config['MAIL_PASSWORD']
     
-    subject = "Аккаунт Exontogram удален"
+    subject = "Аккаунт EFM ID удален"
     body = f"""
     Здравствуйте!
     
-    Ваш аккаунт с EFM ID {efm_id} был успешно удален.
+    Ваш аккаунт с EFM ID {efm_id} был успешно удален из системы EFM ID.
     
     Если вы не совершали это действие, немедленно свяжитесь с администрацией.
     
     С уважением,
-    Команда Exontogram
+    Команда EFM ID
     """
     
     msg = MIMEMultipart()
@@ -243,16 +364,26 @@ def check_echo_posts():
     
     db.session.commit()
 
+def process_post_content(content):
+    """Обрабатывает контент поста, ищет теги и заменяет их"""
+    if '<cat>' in content:
+        # Заменяем тег на URL кота
+        cat_url = get_random_cat()
+        content = content.replace('<cat>', '')
+        return content, cat_url
+    return content, None
+
 def create_admin():
     """Создает администратора при первом запуске"""
     admin = User.query.filter_by(efm_id='admin').first()
     if not admin:
         admin = User(
-            efm_id='admin',  # Только один админ с этим именем
+            efm_id='admin',
             email='efmstudio@inbox.ru',
             display_name='Administrator',
             is_admin=True,
-            is_verified=True
+            is_verified=True,
+            avatar_url=DEFAULT_AVATAR_URL
         )
         admin.set_password('fima1456Game!')
         db.session.add(admin)
@@ -304,7 +435,8 @@ def register():
             efm_id=efm_id,
             email=email,
             display_name=display_name,
-            is_verified=False
+            is_verified=False,
+            avatar_url=DEFAULT_AVATAR_URL
         )
         user.set_password(password)
         
@@ -427,6 +559,28 @@ def settings():
                 user.display_name = new_display_name
                 flash('Имя обновлено', 'success')
         
+        elif action == 'update_avatar':
+            if 'avatar' in request.files:
+                file = request.files['avatar']
+                if file and allowed_file(file.filename):
+                    # Обрабатываем и изменяем размер аватара
+                    avatar_url = process_and_save_image(file, app.config['AVATAR_SIZE'], app.config['IMAGE_QUALITY'])
+                    if avatar_url:
+                        user.avatar_url = avatar_url
+                        flash('Аватар обновлен', 'success')
+                    else:
+                        flash('Ошибка при обработке изображения', 'danger')
+                else:
+                    flash('Неподдерживаемый формат файла. Используйте PNG, JPG, GIF или WEBP', 'danger')
+            
+            elif 'avatar_base64' in request.form and request.form['avatar_base64']:
+                avatar_url = save_base64_image(request.form['avatar_base64'], 'avatar')
+                if avatar_url:
+                    user.avatar_url = avatar_url
+                    flash('Аватар обновлен', 'success')
+                else:
+                    flash('Ошибка при обработке изображения', 'danger')
+        
         elif action == 'change_password':
             current_password = request.form['current_password']
             new_password = request.form['new_password']
@@ -487,11 +641,26 @@ def create_post():
         flash('Пост не может быть пустым', 'danger')
         return redirect(url_for('index'))
     
+    # Обрабатываем контент и ищем тег <cat>
+    processed_content, cat_url = process_post_content(content)
+    
     post = Post(
-        content=content,
+        content=processed_content,
         user_id=user.id,
         is_echo=is_echo
     )
+    
+    # Если есть тег <cat>, добавляем URL кота
+    if cat_url:
+        post.media_url = cat_url
+    
+    # Если есть загруженное изображение
+    if 'media' in request.files:
+        file = request.files['media']
+        if file and allowed_file(file.filename):
+            media_url = process_and_save_image(file, app.config['THUMBNAIL_SIZE'], app.config['IMAGE_QUALITY'])
+            if media_url:
+                post.media_url = media_url
     
     if is_echo:
         post.echo_expires_at = datetime.utcnow() + timedelta(hours=24)
@@ -640,7 +809,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Exontogram - Социальная сеть с EFM ID</title>
+    <title>EFM ID - Социальная сеть</title>
     <style>
         * {
             margin: 0;
@@ -674,6 +843,18 @@ HTML_TEMPLATE = '''
             background: linear-gradient(135deg, #667eea, #764ba2);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
+        }
+        .user-info {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        .avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            object-fit: cover;
+            border: 2px solid #667eea;
         }
         .nav-links a {
             margin-left: 20px;
@@ -779,8 +960,17 @@ HTML_TEMPLATE = '''
             margin-bottom: 15px;
         }
         .post-author {
+            display: flex;
+            align-items: center;
+            gap: 10px;
             font-weight: bold;
             color: #667eea;
+        }
+        .post-author .avatar-small {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            object-fit: cover;
         }
         .post-date {
             color: #999;
@@ -789,6 +979,18 @@ HTML_TEMPLATE = '''
         .post-content {
             margin-bottom: 15px;
             line-height: 1.6;
+        }
+        .post-media {
+            margin: 15px 0;
+            max-width: 100%;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .post-media img {
+            max-width: 100%;
+            max-height: 400px;
+            object-fit: contain;
+            border-radius: 8px;
         }
         .post-stats {
             display: flex;
@@ -825,8 +1027,17 @@ HTML_TEMPLATE = '''
             margin-bottom: 10px;
         }
         .comment-author {
+            display: flex;
+            align-items: center;
+            gap: 8px;
             font-weight: bold;
             color: #667eea;
+        }
+        .comment-author .avatar-tiny {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            object-fit: cover;
         }
         .comment-content {
             margin-top: 5px;
@@ -900,20 +1111,46 @@ HTML_TEMPLATE = '''
             font-size: 14px;
             margin-top: 5px;
         }
+        .current-avatar {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .current-avatar img {
+            width: 100px;
+            height: 100px;
+            border-radius: 50%;
+            object-fit: cover;
+            border: 3px solid #667eea;
+        }
+        .cat-tag {
+            background: linear-gradient(135deg, #fbbf24, #d97706);
+            color: white;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            display: inline-block;
+            margin-bottom: 10px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <div class="logo">Exontogram</div>
+            <div class="logo">EFM ID</div>
             <div class="nav-links">
                 {% if user %}
+                    <div class="user-info">
+                        <img src="{{ user.avatar_url }}" alt="Avatar" class="avatar">
+                        <span>{{ user.display_name }}</span>
+                    </div>
                     <a href="{{ url_for('index') }}">Главная</a>
                     <a href="{{ url_for('settings') }}">Настройки</a>
                     {% if user.is_admin %}
                         <a href="{{ url_for('admin_users') }}">Админ-панель</a>
                     {% endif %}
-                    <a href="{{ url_for('logout') }}">Выйти ({{ user.display_name }})</a>
+                    <a href="{{ url_for('logout') }}">Выйти</a>
                 {% else %}
                     <a href="{{ url_for('index') }}">Главная</a>
                     <a href="{{ url_for('login') }}">Вход</a>
@@ -932,7 +1169,7 @@ HTML_TEMPLATE = '''
             {% endwith %}
             
             {% if request.path == '/register' and not user %}
-                <h2>Регистрация</h2>
+                <h2>Регистрация в EFM ID</h2>
                 <form method="POST">
                     <div class="form-group">
                         <label>EFM ID (уникальное имя)</label>
@@ -968,7 +1205,7 @@ HTML_TEMPLATE = '''
                 </form>
             
             {% elif request.path == '/login' and not user %}
-                <h2>Вход в систему</h2>
+                <h2>Вход в EFM ID</h2>
                 <form method="POST">
                     <div class="form-group">
                         <label>EFM ID или Email</label>
@@ -985,6 +1222,25 @@ HTML_TEMPLATE = '''
             
             {% elif settings_page %}
                 <h2>Настройки профиля</h2>
+                
+                <div class="settings-section">
+                    <h3>Аватар</h3>
+                    <div class="current-avatar">
+                        <img src="{{ user.avatar_url }}" alt="Current avatar">
+                        <div>
+                            <p>Текущий аватар</p>
+                        </div>
+                    </div>
+                    <form method="POST" enctype="multipart/form-data">
+                        <input type="hidden" name="action" value="update_avatar">
+                        <div class="form-group">
+                            <label>Загрузить новый аватар</label>
+                            <input type="file" name="avatar" accept="image/*">
+                            <div class="hint">Рекомендуемый размер: 200x200 пикселей. Поддерживаются: PNG, JPG, GIF, WEBP</div>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Обновить аватар</button>
+                    </form>
+                </div>
                 
                 <div class="settings-section">
                     <h3>Основные настройки</h3>
@@ -1049,9 +1305,10 @@ HTML_TEMPLATE = '''
                 <h3>Пользователи</h3>
                 <table>
                     <tr>
+                        <th>Аватар</th>
                         <th>ID</th>
                         <th>EFM ID</th>
-                        <th>Email (только для админа)</th>
+                        <th>Email</th>
                         <th>Имя</th>
                         <th>Статус</th>
                         <th>Дата регистрации</th>
@@ -1059,6 +1316,7 @@ HTML_TEMPLATE = '''
                     </tr>
                     {% for u in admin_users %}
                     <tr>
+                        <td><img src="{{ u.avatar_url }}" alt="Avatar" style="width: 30px; height: 30px; border-radius: 50%; object-fit: cover;"></td>
                         <td>{{ u.id }}</td>
                         <td>{{ u.efm_id }}</td>
                         <td>{{ u.email }}</td>
@@ -1115,9 +1373,14 @@ HTML_TEMPLATE = '''
                 {% if user %}
                     <h2>Добро пожаловать, {{ user.display_name }}!</h2>
                     
-                    <form method="POST" action="{{ url_for('create_post') }}" style="margin-bottom: 30px;">
+                    <form method="POST" action="{{ url_for('create_post') }}" enctype="multipart/form-data" style="margin-bottom: 30px;">
                         <div class="form-group">
-                            <textarea name="content" rows="3" placeholder="Что у вас нового?" required></textarea>
+                            <textarea name="content" rows="3" placeholder="Что у вас нового? Используйте <cat> для случайного кота" required></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label>Изображение (необязательно)</label>
+                            <input type="file" name="media" accept="image/*">
+                            <div class="hint">Максимальный размер: 800x800 пикселей</div>
                         </div>
                         <div class="form-group">
                             <label>
@@ -1127,15 +1390,18 @@ HTML_TEMPLATE = '''
                         <button type="submit" class="btn btn-primary">Опубликовать</button>
                     </form>
                 {% else %}
-                    <h2>Добро пожаловать в Exontogram!</h2>
-                    <p>Социальная сеть с EFM ID и эхо-постами. <a href="{{ url_for('register') }}">Зарегистрируйтесь</a> или <a href="{{ url_for('login') }}">войдите</a>, чтобы начать.</p>
+                    <h2>Добро пожаловать в EFM ID!</h2>
+                    <p>Социальная сеть с уникальными идентификаторами и эхо-постами. <a href="{{ url_for('register') }}">Зарегистрируйтесь</a> или <a href="{{ url_for('login') }}">войдите</a>, чтобы начать.</p>
                 {% endif %}
                 
                 <h3>Лента постов</h3>
                 {% for post in posts %}
                     <div class="post">
                         <div class="post-header">
-                            <span class="post-author">{{ post.author.display_name }} (@{{ post.author.efm_id }})</span>
+                            <div class="post-author">
+                                <img src="{{ post.author.avatar_url }}" alt="Avatar" class="avatar-small">
+                                <span>{{ post.author.display_name }} (@{{ post.author.efm_id }})</span>
+                            </div>
                             <span class="post-date">{{ post.created_at.strftime('%Y-%m-%d %H:%M') }}</span>
                         </div>
                         
@@ -1145,9 +1411,19 @@ HTML_TEMPLATE = '''
                             <span class="echo-badge echo-survived">Выжившее эхо</span>
                         {% endif %}
                         
+                        {% if '<cat>' in post.content %}
+                            <span class="cat-tag">🐱 Случайный кот</span>
+                        {% endif %}
+                        
                         <div class="post-content">
                             {{ post.content }}
                         </div>
+                        
+                        {% if post.media_url %}
+                            <div class="post-media">
+                                <img src="{{ post.media_url }}" alt="Post media" loading="lazy">
+                            </div>
+                        {% endif %}
                         
                         <div class="post-stats">
                             <span>❤️ {{ post.likes_count }} лайков</span>
@@ -1173,7 +1449,10 @@ HTML_TEMPLATE = '''
                             
                             {% for comment in post.comments if not comment.parent_id %}
                                 <div class="comment">
-                                    <span class="comment-author">{{ comment.author.display_name }}:</span>
+                                    <div class="comment-author">
+                                        <img src="{{ comment.author.avatar_url }}" alt="Avatar" class="avatar-tiny">
+                                        <span>{{ comment.author.display_name }}:</span>
+                                    </div>
                                     <div class="comment-content">{{ comment.content }}</div>
                                     <small>{{ comment.created_at.strftime('%H:%M %d.%m') }}</small>
                                     
@@ -1187,7 +1466,10 @@ HTML_TEMPLATE = '''
                                     
                                     {% for reply in comment.replies %}
                                         <div class="comment" style="margin-left: 20px;">
-                                            <span class="comment-author">{{ reply.author.display_name }}:</span>
+                                            <div class="comment-author">
+                                                <img src="{{ reply.author.avatar_url }}" alt="Avatar" class="avatar-tiny">
+                                                <span>{{ reply.author.display_name }}:</span>
+                                            </div>
                                             <div class="comment-content">{{ reply.content }}</div>
                                             <small>{{ reply.created_at.strftime('%H:%M %d.%m') }}</small>
                                         </div>
